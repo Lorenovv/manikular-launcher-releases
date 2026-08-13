@@ -1,0 +1,79 @@
+name: Publish binary release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - channel/release-source.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify release payload
+        id: release
+        shell: pwsh
+        run: |
+          $source = Get-Content channel/release-source.json -Raw | ConvertFrom-Json
+          if ($source.version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw "Invalid release version." }
+          if ($source.sha256 -notmatch '^[a-f0-9]{64}$' -or [long]$source.size -le 0) { throw "Invalid launcher package metadata." }
+          $packageUri = [Uri]$source.url
+          if ($packageUri.Scheme -ne 'https' -or $packageUri.Host -ne '326d39e8-2e33-4724-a14f-61c64df0c926.selstorage.ru') { throw "Unexpected launcher package host." }
+
+          New-Item artifacts -ItemType Directory -Force | Out-Null
+          $packageName = "ManikularLauncher-$($source.version).zip"
+          $packagePath = Join-Path artifacts $packageName
+          Invoke-WebRequest -Uri $packageUri -OutFile $packagePath
+          $package = Get-Item $packagePath
+          $packageHash = (Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($package.Length -ne [long]$source.size -or $packageHash -ne $source.sha256) { throw "Launcher package verification failed." }
+
+          $assets = @($packagePath)
+          if ($source.installerUrl) {
+            if ($source.installerSha256 -notmatch '^[a-f0-9]{64}$' -or [long]$source.installerSize -le 0) { throw "Invalid installer metadata." }
+            $installerUri = [Uri]$source.installerUrl
+            if ($installerUri.Scheme -ne 'https' -or $installerUri.Host -ne '326d39e8-2e33-4724-a14f-61c64df0c926.selstorage.ru') { throw "Unexpected installer host." }
+            $installerPath = Join-Path artifacts 'ManikularLauncher-Setup.exe'
+            Invoke-WebRequest -Uri $installerUri -OutFile $installerPath
+            $installer = Get-Item $installerPath
+            $installerHash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($installer.Length -ne [long]$source.installerSize -or $installerHash -ne $source.installerSha256) { throw "Installer verification failed." }
+            $assets += $installerPath
+          }
+
+          $tag = "v$($source.version)"
+          $publicUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$packageName"
+          $manifest = @{ version = $source.version; url = $publicUrl; size = $package.Length; sha256 = $packageHash } | ConvertTo-Json -Compress
+          Set-Content artifacts/release.json -Value $manifest -Encoding utf8NoBOM -NoNewline
+          Set-Content artifacts/launcher-release-version.txt -Value $source.version -Encoding ascii -NoNewline
+          $assets += 'artifacts/release.json', 'artifacts/launcher-release-version.txt'
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($source.version)" >> $env:GITHUB_OUTPUT
+          "assets=$($assets -join '|')" >> $env:GITHUB_OUTPUT
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_ASSETS: ${{ steps.release.outputs.assets }}
+        run: |
+          $assets = $env:RELEASE_ASSETS -split '\|'
+          $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Failed to list GitHub Releases." }
+          if ($releases.tagName -contains $env:RELEASE_TAG) {
+            gh release upload $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to replace release assets." }
+            gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --title "Manikular Launcher $env:RELEASE_VERSION" --latest
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update release." }
+          }
+          else {
+            gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Manikular Launcher $env:RELEASE_VERSION" --notes "Automated binary release $env:RELEASE_VERSION." --latest
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create release." }
+          }
